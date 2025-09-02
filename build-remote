@@ -1,0 +1,316 @@
+#!/bin/sh
+
+set -e
+
+. `dirname "$0"`/build-scripts/functions
+
+usage() {
+  echo
+  echo "Usage: build-remote [options] <user@host>"
+  echo
+  echo "Options:"
+  echo "-w <user@host>, --wix-machine=<user@host>"
+  echo "        Windows machine used to build WIX installer."
+  echo "-c <target>, --cross-target=<target>"
+  echo "        Target to compile CFEngine for."
+  echo "-p, <project>, --project=<project>"
+  echo "        Project to compile (community/nova)."
+  echo "-b <branch>, --branch=<branch>"
+  echo "        Which branch to use from each repository."
+  echo "--source=<url>"
+  echo "        Where the git repositories are located. Default is github, but you can"
+  echo "        specify a local path."
+  echo "--role=<hub|agent>"
+  echo "        Either agent or hub."
+  echo "--version=<version string>"
+  echo "        Which version string will appear in the binary and in package names."
+  echo "-t chroot, --test-machine=chroot"
+  echo "        Which machine to use for unsafe tests. Currently chroot inside the"
+  echo "        current machine is the only supported option."
+  echo "--test-shell"
+  echo "        Instead of running the tests, will drop you directly into a shell"
+  echo "        inside the test environment. You can also trigger this specifically"
+  echo "        for the build-scripts/test script by passing TEST_SHELL=1 in the"
+  echo "        environment. Some useful combos:"
+  echo "            BUILD_TYPE=DEBUG TEST_MACHINE=chroot TEST_SHELL=1 \\"
+  echo "                GAINROOT=env build-scripts/test"
+  echo "        will drop you into a shell in a fresh test environment."
+  echo "            BUILD_TYPE=DEBUG TEST_MACHINE=chroot TEST_SHELL=1 \\"
+  echo "                GAINROOT=env build-scripts/test-on-testmachine"
+  echo "        will drop you into a shell in the existing test environment, in other"
+  echo "        words the existing build artifacts will still be there."
+  echo "        Note that in any case the build will not continue afterwards."
+  echo "--no-tests"
+  echo "        Do not run tests."
+  echo "-d /var/cfengine, --workdir=/var/cfengine"
+  echo "        Specify directory which will be CFEngine's workdir. Does not work for"
+  echo "        Windows binaries."
+  echo "--release|--debug|--release-and-debug"
+  echo "        With or without debug symbols."
+  echo "-v, --verbose"
+  echo "        Whether or not to echo the log as the build progresses."
+  echo
+  echo "Project defaults to 'nova'"
+  echo "Branch defaults to 'master', specify --branch=cp if you just want to do simple rsync from the source directories"
+  echo "workdir defaults to '/var/cfengine'"
+  echo "Build type defaults to DEBUG. You may request a RELEASE build using --release"
+  echo "Source defaults to git@github.com:cfengine/"
+  echo
+  echo "NOTE: The following environment variables will be carried to the remote machine:"
+  echo "      CC CPPFLAGS CFLAGS LDFLAGS"
+  echo
+  echo "WiX machine and cross-compilation are not used by default"
+  echo
+}
+
+opts() {
+  OPTS=`getopt -o p:b:w:c:d:vht: --long project:,branch:,wix-machine:,cross-target:,workdir:,verbose,source:,role:,version:,release,debug,help,test-machine:,test-shell,no-tests -n build-remote -- "$@"`
+
+  eval set -- "$OPTS"
+  echo "$?"
+
+  if [ $? != 0 ]
+  then
+    usage
+    exit 1
+  fi
+
+  PROJECT=nova
+  BRANCH=master
+  BUILD_TYPE=DEBUG
+  SOURCE=git@github.com:cfengine
+  BUILD_NUMBER=${BUILD_NUMBER:-unknown}
+  EXPLICIT_ROLE=
+  TEST_MACHINE=${TEST_MACHINE:-}
+  NO_TESTS=${NO_TESTS:-0}
+
+  while true
+  do
+    case "$1" in
+      -p|--project)
+        PROJECT="$2"
+        shift 2;;
+      -b|--branch)
+        BRANCH="$2"
+        shift 2;;
+      -w|--wix-machine)
+        WIX_MACHINE="$2"
+        shift 2;;
+      -c|--cross-target)
+        CROSS_TARGET="$2"
+        shift 2;;
+      -d|--workdir)
+        PREFIX="$2"
+        shift 2;;
+      -v|--verbose)
+        VERBOSE=yes
+        shift;;
+      --release)
+        BUILD_TYPE=RELEASE
+        shift;;
+      --debug)
+        BUILD_TYPE=DEBUG
+        shift;;
+      --source)
+        SOURCE="$2"
+        shift 2;;
+      --role)
+        EXPLICIT_ROLE="$2"
+        shift 2;;
+      --version)
+        EXPLICIT_VERSION="$2"
+        shift 2;;
+      -h|--help)
+        usage
+        exit 0;;
+      -t|--test-machine)
+        TEST_MACHINE="$2"
+        case "$TEST_MACHINE" in
+          chroot)
+            ;;
+          *)
+            echo "Only --test-machine=chroot is supported"
+            exit 1
+            ;;
+        esac
+        shift 2;;
+      --test-shell)
+        TEST_SHELL=1
+        shift;;
+      --no-tests)
+        NO_TESTS=1
+        shift;;
+      --)
+        shift
+        break;;
+      *)
+        echo "Internal error!"
+        exit 1;;
+    esac
+  done
+  echo "$PROJECT $BRANCH $HOST $BUILD_TYPE $SOURCE"
+  if [ $# -ne 1 ]; then
+    usage
+    exit 1
+  fi
+
+  REPOSITORY=$PROJECT-$BRANCH
+  HOST=$1
+
+  export PROJECT BRANCH WIX_MACHINE CROSS_TARGET HOST BUILD_TYPE BUILD_NUMBER EXPLICIT_ROLE EXPLICIT_VERSION TEST_MACHINE TEST_SHELL PREFIX
+
+  export SCHEDULER=$PROJECT-$BRANCH-localbuild
+}
+
+prepare_workdir() {
+  mkdir -p "workdir-$PROJECT-$BRANCH-$HOST"
+  rm -rf "workdir-$PROJECT-$BRANCH-$HOST"/*
+  # In order for tail not to miss any output. If it doesn't exist, there is a small window between
+  # when it is created and when tail discovers it, where output may be missed.
+  touch "workdir-$PROJECT-$BRANCH-$HOST"/build-remote.log
+
+  SCRIPT="$(readlink -f "$0")"
+  AUTOBUILD_PATH="$(pwd)/workdir-$PROJECT-$BRANCH-$HOST/build/buildscripts"
+  export AUTOBUILD_PATH
+  cd "workdir-$PROJECT-$BRANCH-$HOST"
+
+  checkout
+}
+
+checkout() {
+  mkdir -p build
+  rsync -avr --exclude='workdir-*' $(dirname $0)/ build/buildscripts  >>/tmp/rsync.log
+
+  REPOS="core masterfiles"
+
+  case "$PROJECT" in
+    nova)
+      REPOS="$REPOS nova mission-portal"
+  esac
+
+  case "$PROJECT-$BRANCH" in
+    community-master)
+      git clone --recursive $SOURCE/core build/core
+      git clone --recursive $SOURCE/masterfiles build/masterfiles
+      (cd build/masterfiles && git checkout $VERSION) || false
+      ;;
+    community-3.4.x)
+      git clone $SOURCE/core build/core
+      (cd build/core && git checkout 3.4.x) || false
+      ;;
+    community-3.3.x)
+      git clone $SOURCE/core build/core
+      (cd build/core && git checkout -b 3.3.x remotes/origin/3.3.x || git checkout 3.3.x) || false
+      ;;
+    community-3.4.*)
+      VERSION=$BRANCH
+      git clone $SOURCE/core build/core
+      (cd build/core && git checkout $VERSION) || false
+      ;;
+    nova-2.2.2)
+      VERSION=$BRANCH
+      git clone $SOURCE/nova build/nova
+      (cd build/nova && git checkout $VERSION) || false
+      git clone $SOURCE/core build/core
+      (cd build/core && git checkout 3.3.6) || false
+      ;;
+    nova-3.5.x)
+      VERSION=$BRANCH
+      git clone $SOURCE/nova build/nova
+      (cd build/nova && git checkout $VERSION) || false
+      git clone $SOURCE/core build/core
+      (cd build/core && git checkout $VERSION) || false
+      git clone $SOURCE/mission-portal build/mission-portal
+      ;;
+    nova-2.2.*)
+      VERSION=$BRANCH
+      git clone $SOURCE/nova build/nova
+      (cd build/nova && git checkout $VERSION) || false
+      git clone $SOURCE/core build/core
+      (cd build/core && git checkout -b 3.3.x remotes/origin/3.3.x || git checkout 3.3.x) || false
+      ;;
+    nova-master)
+      git clone --recursive $SOURCE/core build/core
+      git clone --recursive $SOURCE/enterprise build/enterprise
+      git clone --recursive $SOURCE/nova build/nova
+      git clone --recursive $SOURCE/mission-portal build/mission-portal
+      git clone --recursive $SOURCE/masterfiles build/masterfiles
+      ;;
+    nova-3.6.x)
+      VERSION=$BRANCH
+      git clone $SOURCE/core build/core
+      (cd build/core && git checkout $VERSION) || false
+      git clone $SOURCE/nova build/nova
+      (cd build/nova && git checkout $VERSION) || false
+      git clone $SOURCE/enterprise build/enterprise
+      (cd build/enterprise && git checkout $VERSION) || false
+      git clone $SOURCE/mission-portal build/mission-portal
+      (cd build/mission-portal && git checkout $VERSION) || false
+      git clone $SOURCE/masterfiles build/masterfiles
+      (cd build/masterfiles && git checkout $VERSION)
+      ;;
+
+    nova-cp)
+      rsync -avr --exclude='workdir-*' $AUTOBUILD_PATH/ build/buildscripts  >>/tmp/rsync.log
+      for d in core nova enterprise masterfiles mission-portal
+      do
+        rsync -avr $SOURCE/$d build  >>/tmp/rsync.log
+      done
+      ;;
+
+    nova-stable)
+      git clone $SOURCE/core build/core
+      (cd build/core && git checkout -b 3.4.x remotes/origin/3.4.x || git checkout 3.4.1n) || false
+      git clone $SOURCE/nova build/nova
+      (cd build/nova && git checkout -b 3.0.x remotes/origin/3.0.x || git checkout 3.0.0) || false
+      git clone $SOURCE/mission-portal build/mission-portal
+      (cd build/mission-portal && git checkout -b 3.0.x remotes/origin/3.0.x || git checkout 3.0.0) || false
+      ;;
+    *)
+      for i in $REPOS
+      do
+        git clone $SOURCE/$i build/$i
+        (cd build/$i && git checkout -b $BRANCH remotes/origin/$BRANCH || git checkout $BRANCH) || false
+      done
+  esac
+}
+
+build() {
+  remote_script configure
+  remote_script compile
+  case "$BUILD_TYPE" in
+    RELEASE)
+      remote_script produce-debug-symbols
+      ;;
+  esac
+
+  if [ "$NO_TESTS" != 1 ]
+  then
+    remote_script test
+  fi
+  remote_script package
+  remote_script prepare-results
+
+  local_script transfer-results
+  local_script install-results
+  local_script clean-results
+}
+
+common_build() {
+  if [ "$VERBOSE" = "yes" ]
+  then
+    tail -F --pid=$$ build-remote.log &
+  fi
+
+  local_script autogen
+  local_script transfer-to-buildmachine
+  remote_script build-environment-check
+  remote_script clean-buildmachine
+  remote_script install-dependencies
+
+  build
+}
+
+opts "$@"
+prepare_workdir
+common_build
